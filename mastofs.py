@@ -602,6 +602,10 @@ class MastoFS(LoggingMixIn, Operations):
 
         # Handle dynamic paths (e.g., /posts, /accounts, /timelines, /notifications)
         parts = norm_path.strip('/').split('/')
+        for part in parts:
+            if part.startswith('.'):
+                raise FuseOSError(errno.ENOENT)
+
         if parts and parts[0] == 'posts':
             return self._resolve_posts(path, parts)
         if parts and parts[0] == 'accounts':
@@ -644,6 +648,8 @@ class MastoFS(LoggingMixIn, Operations):
 
         # /posts/<id>/...
         post_id = parts[1]
+        if post_id.startswith('.'):
+            raise FuseOSError(errno.ENOENT)
         post_obj = self._get_post_cached(post_id)
         if not post_obj:
             raise FuseOSError(errno.ENOENT)
@@ -682,6 +688,8 @@ class MastoFS(LoggingMixIn, Operations):
 
         # /accounts/me
         if parts[1] == 'me':
+            if parts[1].startswith('.'):
+                raise FuseOSError(errno.ENOENT)
             try:
                 acct = self.api.account_verify_credentials()
                 if acct:
@@ -746,6 +754,10 @@ class MastoFS(LoggingMixIn, Operations):
         if len(parts) == 3:
             timeline_type = parts[1]
             idx_s = parts[2]
+
+            if idx_s.startswith('.'):
+                raise FuseOSError(errno.ENOENT)
+
             try:
                 idx = int(idx_s)
             except ValueError as e:
@@ -798,6 +810,10 @@ class MastoFS(LoggingMixIn, Operations):
         if len(parts) == 3:
             notification_type = parts[1]
             idx_s = parts[2]
+
+            if idx_s.startswith('.'):
+                raise FuseOSError(errno.ENOENT)
+
             try:
                 idx = int(idx_s)
             except ValueError as e:
