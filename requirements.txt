@@ -1,0 +1,4 @@
+fusepy>=3.0.1
+Mastodon.py>=2.0.1
+requests>=2.32.3
+cachetools>=5.5.2
