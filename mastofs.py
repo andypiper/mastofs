@@ -270,6 +270,7 @@ class MastoFS(LoggingMixIn, Operations):
             maxsize=long_term_cache_size, ttl=long_term_ttl)
         self.long_term_accounts = TTLCache(
             maxsize=long_term_cache_size, ttl=long_term_ttl)
+        self.media_cache = TTLCache(maxsize=30, ttl=3600)
 
         self.write_buffers = {}
         self.reblog_post = None
@@ -510,6 +511,11 @@ class MastoFS(LoggingMixIn, Operations):
 
     def _fetch_media(self, url):
         """Fetch media content with caching"""
+        # Check if URL is in cache
+        if url in self.media_cache:
+            logger.debug(f"Using cached media for {url}")
+            return self.media_cache[url]
+
         try:
             # Use the shared session for connection pooling
             with self.session.get(url, timeout=(3.0, 30.0),
@@ -529,7 +535,12 @@ class MastoFS(LoggingMixIn, Operations):
                     if chunk:
                         chunks.append(chunk)
 
-                return b''.join(chunks)
+            data = b''.join(chunks)
+
+            # Cache the result
+            self.media_cache[url] = data
+
+            return data
         except requests.exceptions.Timeout:
             logger.error(f"Timeout fetching media from {url}")
             return b""
