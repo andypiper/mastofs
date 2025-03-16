@@ -24,6 +24,26 @@ from mastodon.errors import (MastodonAPIError, MastodonNetworkError,
 from mastodon.return_types import (Account, MediaAttachment, Notification,
                                    Status)
 
+# Filesystem constants
+FS_NAME = "MastoFS"
+FS_DESCRIPTION = "Mastodon as a filesystem"
+FS_VERSION = "0.1"
+FS_ICON_NAME = "mastodon"
+FS_USER_AGENT = f"{FS_NAME}/{FS_VERSION}"
+
+# Default cache settings
+DEFAULT_CACHE_SIZE = 100
+DEFAULT_CACHE_TTL = 5
+DEFAULT_LONG_TERM_CACHE_SIZE = 5000
+DEFAULT_LONG_TERM_TTL = 86400  # 1 day
+DEFAULT_MEDIA_CACHE_SIZE = 30
+DEFAULT_MEDIA_CACHE_TTL = 3600  # 1 hour
+
+# API rate limiting constants
+DEFAULT_MAX_REQUESTS = 300
+DEFAULT_WINDOW_SECONDS = 300
+DEFAULT_INITIAL_BACKOFF = 1.0
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -248,7 +268,7 @@ class PathItem:
 class MastoFS(LoggingMixIn, Operations):
     def __init__(self, url, token, cache_size=100, cache_ttl=5,
                  long_term_cache_size=5000, long_term_ttl=86400,
-                 prefetch_timelines=False, mountpoint=None):
+                 prefetch_timelines=False, mountpoint=None, icon_path=None):
         logger.info(f"Initializing MastoFS with API URL: {url}")
 
         self.api = Mastodon(
@@ -260,7 +280,11 @@ class MastoFS(LoggingMixIn, Operations):
         self.mountpoint = mountpoint
 
         # Setup rate limiting
-        self.rate_limiter = RateLimitManager()
+        self.rate_limiter = RateLimitManager(
+            max_requests=DEFAULT_MAX_REQUESTS,
+            window_seconds=DEFAULT_WINDOW_SECONDS,
+            initial_backoff=DEFAULT_INITIAL_BACKOFF
+        )
         self.api_worker = ApiRequestWorker(self.rate_limiter)
 
         # Setup caches
@@ -270,7 +294,8 @@ class MastoFS(LoggingMixIn, Operations):
             maxsize=long_term_cache_size, ttl=long_term_ttl)
         self.long_term_accounts = TTLCache(
             maxsize=long_term_cache_size, ttl=long_term_ttl)
-        self.media_cache = TTLCache(maxsize=30, ttl=3600)
+        self.media_cache = TTLCache(
+            maxsize=DEFAULT_MEDIA_CACHE_SIZE, ttl=DEFAULT_MEDIA_CACHE_TTL)
 
         self.write_buffers = {}
         self.reblog_post = None
@@ -280,6 +305,16 @@ class MastoFS(LoggingMixIn, Operations):
         self.prefetch_timelines = prefetch_timelines
         self.prefetch_thread = None
         self.running = True
+
+        # Store icon data if provided
+        self.icon_data = None
+        if icon_path and os.path.exists(icon_path):
+            try:
+                with open(icon_path, 'rb') as f:
+                    self.icon_data = f.read()
+                logger.info(f"Loaded custom icon from {icon_path}")
+            except Exception as e:
+                logger.error(f"Error loading icon: {e}")
 
         # Static directories
         self.base_files = {
@@ -358,6 +393,8 @@ class MastoFS(LoggingMixIn, Operations):
             },
         }
 
+        self._add_metadata_files()
+
         # Create a single requests.Session for reuse
         self.session = requests.Session()
 
@@ -405,6 +442,58 @@ class MastoFS(LoggingMixIn, Operations):
 
         self.prefetch_thread = Thread(target=prefetch_thread, daemon=True)
         self.prefetch_thread.start()
+
+    def _add_metadata_files(self):
+        """Add virtual metadata files for better OS integration"""
+        # Root level metadata files
+        children = self.base_files['']['children']
+
+        # XDG Volume Info (Linux)
+        children['.xdg-volume-info'] = {
+            'file': dict(st_mode=(0o644 | stat.S_IFREG), st_nlink=1, st_size=0),
+            'children': None,
+            'content': f"[Volume Info]\nName={FS_NAME}\nIcon={FS_ICON_NAME}\nComment={FS_DESCRIPTION}\n".encode('utf-8')
+        }
+
+        # .VolumeIcon.png (macOS)
+        if self.icon_data:
+            children['.VolumeIcon.png'] = {
+                'file': dict(st_mode=(0o644 | stat.S_IFREG), st_nlink=1,
+                            st_size=len(self.icon_data)),
+                'children': None,
+                'content': self.icon_data
+            }
+
+            # .VolumeIcon.icns (alternative macOS format if available)
+            if self.icon_data.startswith(b'icns'):
+                children['.VolumeIcon.icns'] = {
+                    'file': dict(st_mode=(0o644 | stat.S_IFREG), st_nlink=1,
+                                st_size=len(self.icon_data)),
+                    'children': None,
+                    'content': self.icon_data
+                }
+
+        # .label
+        children['.label'] = {
+            'file': dict(st_mode=(0o644 | stat.S_IFREG), st_nlink=1, st_size=0),
+            'children': None,
+            'content': FS_NAME.encode('utf-8')
+        }
+
+        if sys.platform == 'win32':
+            # autorun.inf (Windows)
+            children['autorun.inf'] = {
+                'file': dict(st_mode=(0o644 | stat.S_IFREG), st_nlink=1, st_size=0),
+                'children': None,
+                'content': f"[autorun]\nicon=.VolumeIcon.png\nlabel={FS_NAME}\n".encode('utf-8')
+            }
+
+            # desktop.ini (Windows)
+            children['desktop.ini'] = {
+                'file': dict(st_mode=(0o644 | stat.S_IFREG), st_nlink=1, st_size=0),
+                'children': None,
+                'content': b"[.ShellClassInfo]\nIconFile=.VolumeIcon.png\nIconIndex=0\n"
+            }
 
     @cachedmethod(operator.attrgetter('mastodon_object_cache'))
     def _get_post_cached(self, post_id):
@@ -520,7 +609,7 @@ class MastoFS(LoggingMixIn, Operations):
             # Use the shared session for connection pooling
             with self.session.get(url, timeout=(3.0, 30.0),
                                   stream=True,  # Stream to handle large files better
-                                  headers={'User-Agent': 'MastoFS/0.1'}) as r:
+                                  headers={'User-Agent': FS_USER_AGENT}) as r:
                 r.raise_for_status()
 
                 # Check content length
@@ -617,16 +706,26 @@ class MastoFS(LoggingMixIn, Operations):
         # Static base tree
         base_item = self._get_base_file(path)
         if base_item is not None:
-            if base_item["children"] is None:
+            if 'content' in base_item:
+                # Special handling for metadata files with stored content
+                size = len(base_item['content'])
+                def read_fn(): return base_item['content']
+                return PathItem(PathType.FILE, time.time(), size=size, read_fn=read_fn)
+            elif base_item["children"] is None:
                 return PathItem(PathType.FILE, time.time(), 0, read_fn=lambda: b"")
             else:
                 base_children = list(base_item["children"].keys())
 
         # Handle dynamic paths (e.g., /posts, /accounts, /timelines, /notifications)
         parts = norm_path.strip('/').split('/')
-        for part in parts:
-            if part.startswith('.'):
-                raise FuseOSError(errno.ENOENT)
+
+        # Silently handle hidden files requests from system/explorers for
+        # paths that aren't explicitly defined in base_files
+        if any(part.startswith('.') for part in parts) and base_item is None:
+            if path.endswith('/'):  # Directory
+                return PathItem(PathType.DIRECTORY, time.time(), listdir_fn=lambda: [])
+            else:  # File
+                return PathItem(PathType.FILE, time.time(), 0, read_fn=lambda: b"")
 
         if parts and parts[0] == 'posts':
             return self._resolve_posts(path, parts)
@@ -934,6 +1033,18 @@ class MastoFS(LoggingMixIn, Operations):
         return PathItem(PathType.FILE, t, size=size, read_fn=lambda: data_str)
 
     def getattr(self, path, fh=None):
+        # check if metadata file
+        base_file = self._get_base_file(path)
+        if base_file and 'content' in base_file:
+            st = {
+                'st_mode': (0o644 | stat.S_IFREG),
+                'st_nlink': 1,
+                'st_size': len(base_file['content']),
+                'st_mtime': time.time(),
+                'st_atime': time.time(),
+                'st_ctime': time.time()
+            }
+            return st
         # We special case the /posts/reblogged directory to allow basically everything without error messages
         # We drop pretty much all writes though
         if path.startswith('/posts/reblogged'):
@@ -1013,6 +1124,11 @@ class MastoFS(LoggingMixIn, Operations):
         return os.path.relpath(target, os.path.dirname(path))
 
     def read(self, path, size, offset, fh):
+        # metadata files handling
+        base_file = self._get_base_file(path)
+        if base_file and 'content' in base_file:
+            content = base_file['content']
+            return content[offset:offset+size]
         # Return contents of the attribute (or potentially downloaded media file)
         item = self._resolve_path(path)
         if item.path_type != PathType.FILE:
@@ -1207,6 +1323,8 @@ def main():
                         help='TTL in seconds for long-term cache (default: 1 day)')
     parser.add_argument('--prefetch', action='store_true',
                         help='Enable background prefetching of timelines')
+    parser.add_argument('--icon', type=str, default=None,
+                        help='Path to icon file (.png or .icns) for the filesystem')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging')
     parser.add_argument('--quiet', action='store_true',
@@ -1245,7 +1363,8 @@ def main():
         long_term_cache_size=args.long_term_cache_size,
         long_term_ttl=args.long_term_ttl,
         prefetch_timelines=args.prefetch,
-        mountpoint=args.mountpoint
+        mountpoint=args.mountpoint,
+        icon_path=args.icon
     )
 
     # Handle signals to gracefully unmount
