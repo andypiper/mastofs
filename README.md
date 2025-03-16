@@ -5,6 +5,7 @@ I may have gone a bit too far
 - cached media handling (but in memory, so: danger!)
 - filesystem metadata
 - notifications path
+- CLI parameters
 - various other poor choices
 
 probably, don't use this.
