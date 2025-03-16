@@ -9,6 +9,7 @@ import signal
 import stat
 import sys
 import time
+
 from collections import deque
 from enum import Enum, auto
 from queue import Empty, Queue
@@ -26,7 +27,7 @@ from mastodon.return_types import (Account, MediaAttachment, Notification,
 
 # Filesystem constants
 FS_NAME = "MastoFS"
-FS_DESCRIPTION = "Mastodon as a filesystem"
+FS_DESCRIPTION = "Mastodon as a Filesystem"
 FS_VERSION = "0.1"
 FS_ICON_NAME = "mastodon"
 FS_USER_AGENT = f"{FS_NAME}/{FS_VERSION}"
@@ -43,6 +44,7 @@ DEFAULT_MEDIA_CACHE_TTL = 3600  # 1 hour
 DEFAULT_MAX_REQUESTS = 300
 DEFAULT_WINDOW_SECONDS = 300
 DEFAULT_INITIAL_BACKOFF = 1.0
+DEFAULT_API_LIMIT = 10
 
 # Setup logging
 logging.basicConfig(
@@ -63,73 +65,100 @@ class PathType(Enum):
 
 class RateLimitManager:
     """
-    Manages API rate limiting
+    Manages API rate limiting with optimized timestamp tracking
     """
 
     def __init__(self, max_requests=300, window_seconds=300, initial_backoff=1.0):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.initial_backoff = initial_backoff
-        self.request_timestamps = deque()
+        # Use maxlen to automatically limit size
+        self.request_timestamps = deque(maxlen=max_requests)
         self.lock = RLock()
         self.current_backoff = initial_backoff
+        self.last_cleanup_time = time.time()
+        self.cleanup_interval = 10  # Only clean up timestamps every 10 seconds
 
     def register_request(self):
-        """Register that a request was made and clean up old timestamps"""
+        """Register that a request was made and periodically clean up old timestamps"""
         current_time = time.time()
         with self.lock:
-            # Remove timestamps older than our window
-            while (self.request_timestamps and
-                   self.request_timestamps[0] < current_time - self.window_seconds):
-                self.request_timestamps.popleft()
-
             # Add current timestamp
             self.request_timestamps.append(current_time)
+
+            # Only clean up periodically to avoid doing it on every request
+            if current_time - self.last_cleanup_time > self.cleanup_interval:
+                self._cleanup_timestamps(current_time)
+                self.last_cleanup_time = current_time
+
+    def _cleanup_timestamps(self, current_time=None):
+        """Clean up old timestamps - only called periodically"""
+        if current_time is None:
+            current_time = time.time()
+
+        cutoff_time = current_time - self.window_seconds
+        # Remove timestamps older than our window
+        while self.request_timestamps and self.request_timestamps[0] < cutoff_time:
+            self.request_timestamps.popleft()
 
     def should_throttle(self):
         """Check if we should throttle"""
         with self.lock:
-            # Clean up old timestamps
+            # Only clean up timestamps if it's been a while
             current_time = time.time()
-            while (self.request_timestamps and
-                   self.request_timestamps[0] < current_time - self.window_seconds):
-                self.request_timestamps.popleft()
+            if current_time - self.last_cleanup_time > self.cleanup_interval:
+                self._cleanup_timestamps(current_time)
+                self.last_cleanup_time = current_time
 
             # If we're close to the limit (90%), start throttling
             return len(self.request_timestamps) > (0.9 * self.max_requests)
 
     def requests_in_window(self):
-        """Count requests in current window"""
+        """Count requests in current window with optimized cleanup"""
         with self.lock:
             current_time = time.time()
-            while (self.request_timestamps and
-                   self.request_timestamps[0] < current_time - self.window_seconds):
-                self.request_timestamps.popleft()
+            # Only clean up if it's been a while since the last cleanup
+            if current_time - self.last_cleanup_time > self.cleanup_interval:
+                self._cleanup_timestamps(current_time)
+                self.last_cleanup_time = current_time
+
             return len(self.request_timestamps)
 
     def backoff_time(self):
-        """Calculate backoff time based on current usage"""
+        """Calculate backoff time based on current usage with progressive strategy"""
         with self.lock:
-            request_ratio = len(self.request_timestamps) / self.max_requests
-            # Linear backoff based on ratio
+            # Get fresh count without unnecessary cleanups
+            request_count = len(self.request_timestamps)
+            request_ratio = request_count / self.max_requests
+
+            # Exponential backoff based on ratio
             if request_ratio > 0.95:
                 return self.current_backoff * 4
             elif request_ratio > 0.8:
                 return self.current_backoff * 2
             elif request_ratio > 0.5:
                 return self.current_backoff
+            # No backoff needed if below 50% capacity
             return 0
 
     def handle_rate_limit_error(self):
         """Increase backoff time when we hit rate limit"""
         with self.lock:
+            # Exponential backoff with a cap
             self.current_backoff = min(
                 self.current_backoff * 2, 30)  # Cap at 30 seconds
             return self.current_backoff
 
     def reset_backoff(self):
-        """Reset backoff to initial value"""
+        """Reset backoff to initial value when usage is low"""
         with self.lock:
+            # Clean up before checking the ratio
+            current_time = time.time()
+            if current_time - self.last_cleanup_time > self.cleanup_interval:
+                self._cleanup_timestamps(current_time)
+                self.last_cleanup_time = current_time
+
+            # Only reset if we're well under the limit
             if len(self.request_timestamps) < (0.3 * self.max_requests):
                 self.current_backoff = self.initial_backoff
 
@@ -137,6 +166,7 @@ class RateLimitManager:
 class ApiRequestWorker:
     """
     Worker thread to handle API requests in the background
+    Modified to be safe for single-threaded FUSE operations
     """
 
     def __init__(self, rate_limit_manager):
@@ -153,17 +183,25 @@ class ApiRequestWorker:
         while self.running:
             try:
                 # Get a request to process
-                request_id, api_function, args, kwargs = self.request_queue.get(
-                    timeout=1)
+                item = self.request_queue.get(timeout=1)
 
-                # Check if we should throttle
+                # Unpack the item correctly - handle both formats
+                if len(item) == 4:
+                    request_id, api_function, args, kwargs = item
+                else:
+                    # This shouldn't happen but handle it
+                    logger.error(
+                        f"Unexpected queue item format: {len(item)} values")
+                    self.request_queue.task_done()
+                    continue
+
+                # Check whether to throttle
                 backoff = self.rate_limiter.backoff_time()
                 if backoff > 0:
                     logger.debug(
                         f"Rate limiting: backing off for {backoff:.2f}s")
                     sleep(backoff)
 
-                # Make the API call
                 try:
                     self.rate_limiter.register_request()
                     result = api_function(*args, **kwargs)
@@ -189,16 +227,17 @@ class ApiRequestWorker:
                     with self.lock:
                         self.result_cache[request_id] = (False, str(e))
 
-                # Mark task as done
+                # Mark as done
                 self.request_queue.task_done()
             except Empty:
-                # No requests to process
                 pass
             except Exception as e:
                 logger.error(f"Error in worker thread: {e}")
 
     def submit_request(self, api_function, *args, **kwargs):
-        """Submit a request to be processed asynchronously"""
+        """
+        Submit a request to be processed asynchronously
+        """
         request_id = id(api_function) + sum(id(arg) for arg in args) + \
             sum(id(k) + id(v) for k, v in kwargs.items())
 
@@ -211,11 +250,12 @@ class ApiRequestWorker:
                 else:
                     raise Exception(f"Previous request failed: {result}")
 
-        # Queue the request
         self.request_queue.put((request_id, api_function, args, kwargs))
 
-        # Wait for the result
-        while True:
+        start_time = time.time()
+        timeout = 60
+
+        while time.time() - start_time < timeout:
             with self.lock:
                 if request_id in self.result_cache:
                     success, result = self.result_cache[request_id]
@@ -223,7 +263,28 @@ class ApiRequestWorker:
                         return result
                     else:
                         raise Exception(f"Request failed: {result}")
+
             sleep(0.1)
+
+        # If we get here, we timed out
+        raise Exception("Request timed out after 60 seconds")
+
+    def submit_request_for_prefetch(self, api_function, *args, **kwargs):
+        """
+        Submit a request with no result waiting - for prefetching only
+        The result will still be cached but we don't wait for it
+        """
+        request_id = id(api_function) + sum(id(arg) for arg in args) + \
+            sum(id(k) + id(v) for k, v in kwargs.items())
+
+        # Check if we already have the result
+        with self.lock:
+            if request_id in self.result_cache:
+                # Already in cache, no need to prefetch
+                return
+
+        # Queue the request
+        self.request_queue.put((request_id, api_function, args, kwargs))
 
     def shutdown(self):
         """Stop the worker thread"""
@@ -403,45 +464,56 @@ class MastoFS(LoggingMixIn, Operations):
             logger.info("Starting background timeline prefetching")
             self._start_prefetching()
 
+
     def _start_prefetching(self):
+        """Start background prefetching"""
         def prefetch_thread():
             while self.running:
                 try:
-                    # Prefetch home timeline
-                    self._get_timeline_cached('home')
-                    if not self.running:
-                        break
-                    sleep(10)
+                    # Check if we're near rate limits before starting new requests
+                    if not self.rate_limiter.should_throttle():
+                        # Prefetch home timeline
+                        logger.debug("Prefetching home timeline")
+                        self.api_worker.submit_request_for_prefetch(
+                            self.api.timeline_home)
+                        sleep(10)
 
-                    # Prefetch notifications
-                    self._get_notifications_cached('all')
-                    if not self.running:
-                        break
-                    sleep(10)
+                        if not self.running:
+                            break
 
-                    # Prefetch local timeline
-                    self._get_timeline_cached('local')
-                    if not self.running:
-                        break
-                    sleep(10)
+                        # Prefetch notifications next
+                        logger.debug("Prefetching notifications")
+                        self.api_worker.submit_request_for_prefetch(
+                            self.api.notifications)
+                        sleep(10)
 
-                    # Prefetch public timelines
-                    self._get_timeline_cached('federated')
-                    self._get_timeline_cached('public')
+                        if not self.running:
+                            break
 
-                    # Check whether to back off
-                    if self.rate_limiter.should_throttle():
-                        logger.info(
-                            "Throttling prefetch due to rate limit concerns")
-                        sleep(300)  # 5 minutes
+                        # Prefetch local timeline
+                        logger.debug("Prefetching local timeline")
+                        self.api_worker.submit_request_for_prefetch(
+                            self.api.timeline_local)
+
+                        # Check whether to back off
+                        if self.rate_limiter.should_throttle():
+                            logger.info(
+                                "Throttling prefetch due to rate limit concerns")
+                            sleep(300)  # 5 minutes
+                        else:
+                            sleep(120)  # 2 minutes
                     else:
-                        sleep(120)  # 2 minutes
+                        # Already near rate limits, back off
+                        logger.info("Skipping prefetch due to rate limit concerns")
+                        sleep(60)  # 1 minute
+
                 except Exception as e:
                     logger.error(f"Error in prefetch thread: {e}")
-                    sleep(60) # Wait a bit before retrying
+                    sleep(60)
 
         self.prefetch_thread = Thread(target=prefetch_thread, daemon=True)
         self.prefetch_thread.start()
+        logger.info("Started background timeline prefetching")
 
     def _add_metadata_files(self):
         """Add virtual metadata files for better OS integration"""
@@ -464,14 +536,14 @@ class MastoFS(LoggingMixIn, Operations):
                 'content': self.icon_data
             }
 
-            # .VolumeIcon.icns (alternative macOS format if available)
-            if self.icon_data.startswith(b'icns'):
-                children['.VolumeIcon.icns'] = {
-                    'file': dict(st_mode=(0o644 | stat.S_IFREG), st_nlink=1,
-                                st_size=len(self.icon_data)),
-                    'children': None,
-                    'content': self.icon_data
-                }
+            # # .VolumeIcon.icns (macOS)
+            # if self.icon_data.startswith(b'icns'):
+            #     children['.VolumeIcon.icns'] = {
+            #         'file': dict(st_mode=(0o644 | stat.S_IFREG), st_nlink=1,
+            #                     st_size=len(self.icon_data)),
+            #         'children': None,
+            #         'content': self.icon_data
+            #     }
 
         # .label
         children['.label'] = {
@@ -495,6 +567,7 @@ class MastoFS(LoggingMixIn, Operations):
                 'content': b"[.ShellClassInfo]\nIconFile=.VolumeIcon.png\nIconIndex=0\n"
             }
 
+
     @cachedmethod(operator.attrgetter('mastodon_object_cache'))
     def _get_post_cached(self, post_id):
         """Get a post with caching and rate limiting"""
@@ -507,6 +580,7 @@ class MastoFS(LoggingMixIn, Operations):
         except Exception as e:
             logger.error(f"Error fetching post {post_id}: {str(e)}")
             return None
+
 
     @cachedmethod(operator.attrgetter('mastodon_object_cache'))
     def _get_account_cached(self, account_id):
@@ -521,24 +595,26 @@ class MastoFS(LoggingMixIn, Operations):
             logger.error(f"Error fetching account {account_id}: {str(e)}")
             return None
 
+
     @cachedmethod(operator.attrgetter('mastodon_object_cache'))
     def _get_timeline_cached(self, timeline_type):
         """Get a timeline with caching and rate limiting"""
         try:
             logger.debug(f"Fetching timeline {timeline_type}")
             if timeline_type == 'home':
-                return self.api_worker.submit_request(self.api.timeline_home)
+                return self.api_worker.submit_request(self.api.timeline_home, limit=DEFAULT_API_LIMIT)
             elif timeline_type == 'local':
-                return self.api_worker.submit_request(self.api.timeline_local)
+                return self.api_worker.submit_request(self.api.timeline_local, limit=DEFAULT_API_LIMIT)
             elif timeline_type == 'federated':
-                return self.api_worker.submit_request(self.api.timeline_public)
+                return self.api_worker.submit_request(self.api.timeline_public, limit=DEFAULT_API_LIMIT)
             elif timeline_type == 'public':
                 return self.api_worker.submit_request(
-                    self.api.timeline_public, local=False)
+                    self.api.timeline_public, local=False, limit=DEFAULT_API_LIMIT)
             return []
         except Exception as e:
             logger.error(f"Error fetching timeline {timeline_type}: {str(e)}")
             return []
+
 
     @cachedmethod(operator.attrgetter('mastodon_object_cache'))
     def _get_notifications_cached(self, notification_type=None):
@@ -546,19 +622,21 @@ class MastoFS(LoggingMixIn, Operations):
         try:
             if notification_type == 'all':
                 logger.debug("Fetching all notifications")
-                return self.api_worker.submit_request(self.api.notifications)
+                return self.api_worker.submit_request(self.api.notifications, limit=DEFAULT_API_LIMIT)
             elif notification_type in ['mention', 'favourite', 'reblog', 'follow']:
                 logger.debug(
                     f"Fetching notifications of type {notification_type}")
                 try:
                     return self.api_worker.submit_request(self.api.notifications,
-                                                          types=[notification_type])
+                                                        types=[
+                                                            notification_type],
+                                                        limit=DEFAULT_API_LIMIT)
                 except TypeError as e:
                     logger.warning(
                         f"API error with 'types' parameter: {str(e)}")
-                    # Fallback: fetch all notifications and filter them manually
+                    # Fallback: fetch and filter manually
                     all_notifications = self.api_worker.submit_request(
-                        self.api.notifications)
+                        self.api.notifications, limit=DEFAULT_API_LIMIT)
                     return [n for n in all_notifications if n.type == notification_type]
             return []
         except Exception as e:
@@ -606,19 +684,19 @@ class MastoFS(LoggingMixIn, Operations):
             return self.media_cache[url]
 
         try:
-            # Use the shared session for connection pooling
+            # Use shared session for connection pooling
             with self.session.get(url, timeout=(3.0, 30.0),
-                                  stream=True,  # Stream to handle large files better
+                                  stream=True,
                                   headers={'User-Agent': FS_USER_AGENT}) as r:
                 r.raise_for_status()
 
                 # Check content length
                 content_length = r.headers.get('Content-Length')
-                if content_length and int(content_length) > 10 * 1024 * 1024:  # >10MB
+                if content_length and int(content_length) > 10 * 1024 * 1024:
                     logger.warning(
                         f"Large media file detected: {url} ({int(content_length)/1024/1024:.1f} MB)")
 
-                # Stream and read in chunks for better memory handling
+                # Stream and read in chunks
                 chunks = []
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
@@ -676,7 +754,6 @@ class MastoFS(LoggingMixIn, Operations):
                 if key in ["avatar", "avatar_static", "header", "header_static"] and key in obj:
                     return self._fetch_media(obj[key])
 
-            # Regular dictionary access (this was missing in the problem code)
             try:
                 return obj[key]
             except KeyError:
@@ -783,7 +860,7 @@ class MastoFS(LoggingMixIn, Operations):
                 return self._list_keys(post_obj)
             return PathItem(PathType.DIRECTORY, t, listdir_fn=listdir_post)
 
-        # Traverse deeper into the object
+        # Traverse deeper
         try:
             final_obj = self._traverse(post_obj, parts[2:])
         except (KeyError, IndexError) as e:
@@ -846,7 +923,7 @@ class MastoFS(LoggingMixIn, Operations):
                 return self._list_keys(acct_obj)
             return PathItem(PathType.DIRECTORY, t, listdir_fn=list_acct)
 
-        # Traverse deeper into the object
+        # Traverse deeper
         try:
             sub = self._traverse(acct_obj, parts[2:])
         except (KeyError, IndexError) as e:
@@ -899,14 +976,19 @@ class MastoFS(LoggingMixIn, Operations):
             return PathItem(PathType.SYMLINK, t, symlink_target=symlink_target)
         raise FuseOSError(errno.ENOENT)
 
+
     def _resolve_notifications(self, path, parts):
-        """Handle /notifications/... paths"""
+        """Handle /notifications/... paths with improved debugging"""
+
         # /notifications
         if len(parts) == 1:
             node = self._get_base_file(path)
 
             def list_notif_types():
-                return list(node['children'].keys()) if node and 'children' in node else []
+                children = list(node['children'].keys()
+                                ) if node and 'children' in node else []
+                logger.debug(f"Notification types available: {children}")
+                return children
             return PathItem(PathType.DIRECTORY, time.time(), listdir_fn=list_notif_types)
 
         # /notifications/<type> (all, mention, favourite, reblog, follow)
@@ -919,12 +1001,21 @@ class MastoFS(LoggingMixIn, Operations):
             node = self._get_base_file(path)
 
             def list_notifications():
+                # First get any static entries
                 base = list(node['children'].keys()
                             ) if node and 'children' in node else []
-                notifications = self._get_notifications_cached(
-                    notification_type)
-                base.extend(str(i) for i in range(len(notifications)))
+
+                # Then fetch the notifications
+                notifications = self._get_notifications_cached(notification_type)
+
+                # Create numerical indices
+                indices = [str(i) for i in range(len(notifications))]
+                base.extend(indices)
+
+                logger.debug(
+                    f"Notification listing for {notification_type}: found {len(indices)} notifications")
                 return base
+
             return PathItem(PathType.DIRECTORY, time.time(), listdir_fn=list_notifications)
 
         # /notifications/<type>/<index>
@@ -941,38 +1032,69 @@ class MastoFS(LoggingMixIn, Operations):
                 logger.error(f"Error converting index to integer: {str(e)}")
                 raise FuseOSError(errno.ENOENT)
 
+            # Fetch notifications
+            logger.debug(
+                f"Fetching notification item at index {idx} for type {notification_type}")
             notifications = self._get_notifications_cached(notification_type)
+
+            if not notifications:
+                logger.warning(
+                    f"No notifications found for type {notification_type}")
+                raise FuseOSError(errno.ENOENT)
+
             if idx < 0 or idx >= len(notifications):
                 logger.error(
                     f"Notification index out of range: {idx} for notifications of length {len(notifications)}")
                 raise FuseOSError(errno.ENOENT)
 
             notification = notifications[idx]
+            logger.debug(
+                f"Retrieved notification at index {idx}: {type(notification).__name__}")
 
-            # Handle different notification types appropriately
+            # Handle different notification types
             t = self._extract_time(notification)
 
-            # Create a safe way to check if attributes exist
             def has_attr(obj, attr):
                 return hasattr(obj, attr) and getattr(obj, attr) is not None
 
+            # Check if this is actually a Notification
+            if not isinstance(notification, Notification):
+                logger.warning(
+                    f"Expected Notification object but got {type(notification).__name__}")
+                # Fallback to treating it as a generic object
+
+                def listdir_fn():
+                    keys = self._list_keys(notification)
+                    logger.debug(f"Generic object keys: {keys}")
+                    return keys
+                return PathItem(PathType.DIRECTORY, t, listdir_fn=listdir_fn)
+
             # For notifications with a status reference
             if has_attr(notification, 'status') and has_attr(notification.status, 'id'):
+                target = f"/posts/{notification.status.id}"
+
                 def symlink_target():
-                    return f"/posts/{notification.status.id}"
+                    return target
                 return PathItem(PathType.SYMLINK, t, symlink_target=symlink_target)
 
             # For follow notifications (or any with only an account reference)
-            elif notification.type == 'follow' or (has_attr(notification, 'account') and not has_attr(notification, 'status')):
-                def symlink_target():
-                    return f"/accounts/{notification.account.id}"
-                return PathItem(PathType.SYMLINK, t, symlink_target=symlink_target)
+            elif has_attr(notification, 'type') and notification.type == 'follow' or (has_attr(notification, 'account') and not has_attr(notification, 'status')):
+                if has_attr(notification, 'account') and has_attr(notification.account, 'id'):
+                    target = f"/accounts/{notification.account.id}"
+
+                    def symlink_target():
+                        return target
+                    return PathItem(PathType.SYMLINK, t, symlink_target=symlink_target)
+                else:
+                    logger.warning(
+                        "Follow notification without valid account reference")
 
             # For all other notification types, create a directory with notification details
-            else:
-                def listdir_fn():
-                    return self._list_keys(notification)
-                return PathItem(PathType.DIRECTORY, t, listdir_fn=listdir_fn)
+            def listdir_fn():
+                keys = self._list_keys(notification)
+                logger.debug(f"Notification object keys: {keys}")
+                return keys
+            return PathItem(PathType.DIRECTORY, t, listdir_fn=listdir_fn)
 
         raise FuseOSError(errno.ENOENT)
 
@@ -1178,6 +1300,7 @@ class MastoFS(LoggingMixIn, Operations):
             return 0
         raise FuseOSError(errno.EROFS)
 
+
     def release(self, path, fh):
         # on close: post whatever is in the write buffer
         if path == '/posts/new':
@@ -1185,15 +1308,23 @@ class MastoFS(LoggingMixIn, Operations):
             if buf:
                 text = buf.decode('utf-8')
                 try:
-                    # Use the api_worker for rate-limited API access
-                    newp = self.api_worker.submit_request(
-                        self.api.status_post, text)
-                    if newp:
-                        self.long_term_posts[str(newp.id)] = True
-                        logger.info(
-                            f"Successfully posted status with ID: {newp.id}")
+                    # Define a callback to handle post completion
+                    def on_post_complete(success, result):
+                        if success and result:
+                            self.long_term_posts[str(result.id)] = True
+                            logger.info(
+                                f"Successfully posted status with ID: {result.id}")
+                        else:
+                            logger.error(f"Error posting status: {result}")
+
+                    # Submit the post request asynchronously
+                    self.api_worker.submit_request_async(
+                        self.api.status_post,
+                        callback=on_post_complete,
+                        status=text
+                    )
                 except Exception as e:
-                    logger.error(f"Error posting status: {str(e)}")
+                    logger.error(f"Error submitting post request: {str(e)}")
                 finally:
                     if path in self.write_buffers:
                         del self.write_buffers[path]
@@ -1204,17 +1335,28 @@ class MastoFS(LoggingMixIn, Operations):
                 if path.split('/')[-1] == "id":
                     try:
                         if self.reblog_buffer:
-                            # Use the api_worker for rate-limited API access
-                            self.api_worker.submit_request(
-                                self.api.status_reblog, self.reblog_buffer)
-                            logger.info(
-                                f"Successfully reblogged status: {self.reblog_buffer}")
-                            self.reblog_buffer = None
+                            # Define a callback to handle reblog completion
+                            def on_reblog_complete(success, result):
+                                if success:
+                                    logger.info(
+                                        f"Successfully reblogged status: {self.reblog_buffer}")
+                                else:
+                                    logger.error(
+                                        f"Error reblogging status: {result}")
+                                # Clear the buffer regardless of success
+                                self.reblog_buffer = None
+
+                            # Submit the reblog request asynchronously
+                            self.api_worker.submit_request_async(
+                                self.api.status_reblog,
+                                callback=on_reblog_complete,
+                                id=self.reblog_buffer
+                            )
                         else:
-                            logger.warning(
-                                "Attempted to reblog with empty buffer")
+                            logger.warning("Attempted to reblog with empty buffer")
                     except Exception as e:
-                        logger.error(f"Error reblogging status: {str(e)}")
+                        logger.error(f"Error submitting reblog request: {str(e)}")
+                        self.reblog_buffer = None
         return 0
 
     def truncate(self, path, length, fh=None):
@@ -1324,7 +1466,7 @@ def main():
     parser.add_argument('--prefetch', action='store_true',
                         help='Enable background prefetching of timelines')
     parser.add_argument('--icon', type=str, default=None,
-                        help='Path to icon file (.png or .icns) for the filesystem')
+                        help='Path to icon file for the filesystem')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging')
     parser.add_argument('--quiet', action='store_true',
