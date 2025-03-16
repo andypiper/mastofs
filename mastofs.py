@@ -374,23 +374,23 @@ class MastoFS(LoggingMixIn, Operations):
                     self._get_timeline_cached('home')
                     if not self.running:
                         break
-                    sleep(60)
-
-                    # Prefetch local timeline
-                    self._get_timeline_cached('local')
-                    if not self.running:
-                        break
-                    sleep(60)
-
-                    # Prefetch public timelines
-                    self._get_timeline_cached('federated')
-                    self._get_timeline_cached('public')
+                    sleep(10)
 
                     # Prefetch notifications
                     self._get_notifications_cached('all')
                     if not self.running:
                         break
-                    sleep(60)
+                    sleep(10)
+
+                    # Prefetch local timeline
+                    self._get_timeline_cached('local')
+                    if not self.running:
+                        break
+                    sleep(10)
+
+                    # Prefetch public timelines
+                    self._get_timeline_cached('federated')
+                    self._get_timeline_cached('public')
 
                     # Check whether to back off
                     if self.rate_limiter.should_throttle():
@@ -561,8 +561,10 @@ class MastoFS(LoggingMixIn, Operations):
                     base_keys.append("file")
                 if "preview_url" in obj and "preview_file" not in base_keys:
                     base_keys.append("preview_file")
+
             return base_keys
         return []
+
 
     def _get_child(self, obj, key):
         if isinstance(obj, list):
@@ -573,16 +575,25 @@ class MastoFS(LoggingMixIn, Operations):
                 logger.error(f"Error accessing list item {key}: {str(e)}")
                 raise KeyError(f"Invalid list index: {key}")
         if isinstance(obj, dict):
+            # Handle MediaAttachment objects
             if isinstance(obj, MediaAttachment):
                 if key == "file" and "url" in obj:
                     return self._fetch_media(obj["url"])
                 if key == "preview_file" and "preview_url" in obj:
                     return self._fetch_media(obj["preview_url"])
+
+            # Handle Account objects
+            if isinstance(obj, Account):
+                if key in ["avatar", "avatar_static", "header", "header_static"] and key in obj:
+                    return self._fetch_media(obj[key])
+
+            # Regular dictionary access (this was missing in the problem code)
             try:
                 return obj[key]
             except KeyError:
                 logger.error(f"Key {key} not found in object")
                 raise
+
         raise KeyError("No children")
 
     def _traverse(self, obj, parts):
@@ -1116,6 +1127,10 @@ class MastoFS(LoggingMixIn, Operations):
 
         # Flush any pending write operations
         self._flush_write_buffers()
+
+        if hasattr(self, 'media_cache'):
+            logger.debug("Clearing media cache...")
+            self.media_cache.clear()
 
         # Shutdown the API worker
         if hasattr(self, 'api_worker') and self.api_worker:
